@@ -21,9 +21,9 @@ if [ -n "$missing" ]; then
     echo "Missing required tools:$missing"
     echo ""
     if command -v brew &> /dev/null; then
-        echo "Install with:  brew install$missing"
+        echo "Install with: brew install$missing"
     elif command -v apt &> /dev/null; then
-        echo "Install with:  sudo apt install$missing"
+        echo "Install with: sudo apt install$missing"
     else
         echo "Please install:$missing"
     fi
@@ -35,15 +35,16 @@ if [ ! -d "venv" ]; then
     echo "Setting up virtual environment..."
     python3 -m venv venv
     source venv/bin/activate
-    pip install -q flask yt-dlp
+    pip install -q -r requirements.txt
 else
     source venv/bin/activate
+    pip install -q -r requirements.txt
 fi
 
 PORT="${PORT:-8899}"
 export PORT
 
 echo ""
-echo "  ReClip is running at http://localhost:$PORT"
+echo " ReClip is running at http://localhost:$PORT"
 echo ""
 python3 app.py
