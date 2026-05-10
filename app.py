@@ -2,19 +2,37 @@ import os
 import uuid
 import glob
 import json
+import time
 import subprocess
 import threading
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, send_file, render_template, after_this_request
 
 app = Flask(__name__)
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 jobs = {}
+jobs_lock = threading.Lock()
+
+
+def cleanup_old_jobs(max_age_seconds=3600):
+    """Remove jobs and their files that are older than max_age_seconds."""
+    now = time.time()
+    with jobs_lock:
+        stale = [jid for jid, j in jobs.items() if now - j.get("created_at", now) > max_age_seconds]
+    for jid in stale:
+        with jobs_lock:
+            job = jobs.pop(jid, None)
+        if job and job.get("file"):
+            try:
+                os.remove(job["file"])
+            except OSError:
+                pass
 
 
 def run_download(job_id, url, format_choice, format_id):
-    job = jobs[job_id]
+    with jobs_lock:
+        job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
     cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
@@ -31,14 +49,16 @@ def run_download(job_id, url, format_choice, format_id):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
-            job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
+            with jobs_lock:
+                job["status"] = "error"
+                job["error"] = result.stderr.strip().split("\n")[-1]
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
         if not files:
-            job["status"] = "error"
-            job["error"] = "Download completed but no file was found"
+            with jobs_lock:
+                job["status"] = "error"
+                job["error"] = "Download completed but no file was found"
             return
 
         if format_choice == "audio":
@@ -55,26 +75,33 @@ def run_download(job_id, url, format_choice, format_id):
                 except OSError:
                     pass
 
-        job["status"] = "done"
-        job["file"] = chosen
         ext = os.path.splitext(chosen)[1]
         title = job.get("title", "").strip()
-        # Sanitize title for filename
+        # Sanitize title for filename (max 80 chars to keep names meaningful)
         if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:20].strip()
-            job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
+            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:80].strip()
+            filename = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
         else:
-            job["filename"] = os.path.basename(chosen)
+            filename = os.path.basename(chosen)
+
+        with jobs_lock:
+            job["status"] = "done"
+            job["file"] = chosen
+            job["filename"] = filename
+
     except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
+        with jobs_lock:
+            job["status"] = "error"
+            job["error"] = "Download timed out (5 min limit)"
     except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
+        with jobs_lock:
+            job["status"] = "error"
+            job["error"] = str(e)
 
 
 @app.route("/")
 def index():
+    cleanup_old_jobs()
     return render_template("index.html")
 
 
@@ -136,7 +163,8 @@ def start_download():
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
+    with jobs_lock:
+        jobs[job_id] = {"status": "downloading", "url": url, "title": title, "created_at": time.time()}
 
     thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
     thread.daemon = True
@@ -147,7 +175,8 @@ def start_download():
 
 @app.route("/api/status/<job_id>")
 def check_status(job_id):
-    job = jobs.get(job_id)
+    with jobs_lock:
+        job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
     return jsonify({
@@ -159,10 +188,25 @@ def check_status(job_id):
 
 @app.route("/api/file/<job_id>")
 def download_file(job_id):
-    job = jobs.get(job_id)
+    with jobs_lock:
+        job = jobs.get(job_id)
     if not job or job["status"] != "done":
         return jsonify({"error": "File not ready"}), 404
-    return send_file(job["file"], as_attachment=True, download_name=job["filename"])
+
+    file_path = job["file"]
+    filename = job["filename"]
+
+    @after_this_request
+    def remove_file(response):
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        with jobs_lock:
+            jobs.pop(job_id, None)
+        return response
+
+    return send_file(file_path, as_attachment=True, download_name=filename)
 
 
 if __name__ == "__main__":
